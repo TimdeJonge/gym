@@ -3,7 +3,7 @@ __credits__ = ["Andrea PIERRÉ"]
 import math
 import sys
 from typing import Optional
-
+import time
 import numpy as np
 
 import Box2D
@@ -26,8 +26,6 @@ SCALE = 30.0  # affects how fast-paced the game is, forces should be adjusted as
 MAIN_ENGINE_POWER = 13.0
 SIDE_ENGINE_POWER = 0.6
 
-INITIAL_RANDOM = 1000.0  # Set 1500 to make game harder
-
 LANDER_POLY = [(-14, +17), (-17, 0), (-17, -10), (+17, -10), (+17, 0), (+14, +17)]
 LEG_AWAY = 20
 LEG_DOWN = 18
@@ -37,8 +35,8 @@ LEG_SPRING_TORQUE = 40
 SIDE_ENGINE_HEIGHT = 14.0
 SIDE_ENGINE_AWAY = 12.0
 
-VIEWPORT_W = 600
-VIEWPORT_H = 400
+VIEWPORT_W = 1000
+VIEWPORT_H = 800
 
 
 class ContactDetector(contactListener):
@@ -147,6 +145,9 @@ class LunarLander(gym.Env, EzPickle):
         self.moon = None
         self.lander = None
         self.particles = []
+        self.options = None
+        self.actions = []
+        self.seed_used = None
 
         self.prev_reward = None
 
@@ -185,7 +186,10 @@ class LunarLander(gym.Env, EzPickle):
         self.world.contactListener = self.world.contactListener_keepref
         self.game_over = False
         self.prev_shaping = None
-
+        self.options = options
+        self.actions = []
+        self.seed_used = seed
+        self.fitness_weights = options.get('fitness_weights', {})
         W = VIEWPORT_W / SCALE
         H = VIEWPORT_H / SCALE
 
@@ -236,13 +240,20 @@ class LunarLander(gym.Env, EzPickle):
         )
         self.lander.color1 = (0.5, 0.4, 0.9)
         self.lander.color2 = (0.3, 0.3, 0.5)
-        self.lander.ApplyForceToCenter(
-            (
-                self.np_random.uniform(-INITIAL_RANDOM, INITIAL_RANDOM),
-                self.np_random.uniform(-INITIAL_RANDOM, INITIAL_RANDOM),
-            ),
-            True,
-        )
+        if options.get('random_push_size'):
+            self.lander.ApplyForceToCenter(
+                (
+                    self.np_random.uniform(-options['random_push_size'], options['random_push_size']),
+                    self.np_random.uniform(-options['random_push_size'], options['random_push_size'])
+                ),
+                True,
+            )
+        if options.get('push'):
+            self.lander.ApplyForceToCenter(options['push'], True)
+        if options.get('horizontal_push'):
+            self.lander.ApplyLinearImpulse((options['horizontal_push'],0), (self.lander.position[0], self.lander.position[1] + 0.080255), True)
+        if options.get('spin'):
+            self.lander.ApplyTorque(options['spin'], True)
 
         self.legs = []
         for i in [-1, +1]:
@@ -283,7 +294,7 @@ class LunarLander(gym.Env, EzPickle):
 
         self.drawlist = [self.lander] + self.legs
 
-        return self.step(np.array([0, 0]) if self.continuous else 0)[0]
+        return self.step([0, 0] if self.continuous else 0)[0]
 
     def _create_particle(self, mass, x, y, ttl):
         p = self.world.CreateDynamicBody(
@@ -308,6 +319,7 @@ class LunarLander(gym.Env, EzPickle):
             self.world.DestroyBody(self.particles.pop(0))
 
     def step(self, action):
+        self.actions.append(action)
         if self.continuous:
             action = np.clip(action, -1, +1).astype(np.float32)
         else:
@@ -401,14 +413,22 @@ class LunarLander(gym.Env, EzPickle):
             1.0 if self.legs[1].ground_contact else 0.0,
         ]
         assert len(state) == 8
+        
+        #Possible reward entries:
+        #   -   Location (min)
+        #   -   Speed (min)
+        #   -   Rotation (min)
+        #   -   Life Span (max)
+        #   -   Fuel use (min)
+        #   -   Termination condition (Landing / Death / Exit Screen)
 
         reward = 0
         shaping = (
-            -100 * np.sqrt(state[0] * state[0] + state[1] * state[1])
-            - 100 * np.sqrt(state[2] * state[2] + state[3] * state[3])
-            - 100 * abs(state[4])
-            + 10 * state[6]
-            + 10 * state[7]
+            - self.fitness_weights.get('location', 100) * np.sqrt(state[0] * state[0] + state[1] * state[1])
+            - self.fitness_weights.get('speed', 100) * np.sqrt(state[2] * state[2] + state[3] * state[3])
+            - self.fitness_weights.get('spin', 10) * abs(state[4])
+            + self.fitness_weights.get('leg_contact', 10) * state[6]
+            + self.fitness_weights.get('leg_contact', 10) * state[7]
         )  # And ten points for legs contact, the idea is if you
         # lose contact again after landing, you get negative reward
         if self.prev_shaping is not None:
@@ -416,17 +436,19 @@ class LunarLander(gym.Env, EzPickle):
         self.prev_shaping = shaping
 
         reward -= (
-            m_power * 0.30
+            m_power *  self.fitness_weights.get('main_engine', 0.3)
         )  # less fuel spent is better, about -30 for heuristic landing
-        reward -= s_power * 0.03
+        reward -= s_power * self.fitness_weights.get('side_engine', 0.03)
+        reward += self.fitness_weights.get('life_span', 1)
 
         done = False
         if self.game_over or abs(state[0]) >= 1.0:
             done = True
-            reward = -100
+            reward = 0
         if not self.lander.awake:
             done = True
-            reward = +100
+            reward = self.fitness_weights.get('termination', 200)
+
         return np.array(state, dtype=np.float32), reward, done, {}
 
     def render(self, mode="human"):
@@ -485,6 +507,33 @@ class LunarLander(gym.Env, EzPickle):
             )
 
         return self.viewer.render(return_rgb_array=mode == "rgb_array")
+    
+    def log(self, file_location):
+        with open(file_location, 'w+') as f:
+            f.write(repr(self.options) + '\n')
+            f.write(repr(self.seed_used)+ '\n')
+            for action in self.actions:
+                f.write(str(action)+ '\n')
+
+    def replay(self, file_location):
+        with open(file_location) as f:
+            options = eval(f.readline())
+            seed = eval(f.readline())
+            print(seed, options)
+            self.reset(seed=seed, options=options)
+            f.readline() # the action taken by reset is saved in the file, but here too is done by reset
+            for action in f:
+                self.step(eval(action))
+                self.render()
+                time.sleep(1/60.0)
+            self.close()
+
+    def report(self):
+        state = self.state
+        print(f'location={state[0]:.2f}, {state[1]:.2f}')
+        print(f'speed={state[2]:.2f}, {state[3]:.2f}')
+        print(f'angle={state[4]:.2f}')
+        print(f'angular_velocity={state[5]:.5f}')
 
     def close(self):
         if self.viewer is not None:
@@ -545,10 +594,10 @@ def heuristic(env, s):
     return a
 
 
-def demo_heuristic_lander(env, seed=None, render=False):
+def demo_heuristic_lander(env, seed=20, render=False):
     total_reward = 0
     steps = 0
-    s = env.reset(seed=seed)
+    s = env.reset(seed=seed, options={'push': [1900, -950]})
     while True:
         a = heuristic(env, s)
         s, r, done, info = env.step(a)
@@ -581,4 +630,8 @@ class LunarLanderContinuous:
 
 
 if __name__ == "__main__":
-    demo_heuristic_lander(LunarLander(), render=True)
+    env = LunarLander()
+    demo_heuristic_lander(env, render=True)
+    env.log('test_file.txt')
+    env.replay('test_file.txt')
+    env.close()
